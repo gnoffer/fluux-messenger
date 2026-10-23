@@ -1,0 +1,101 @@
+# toms-ios.yml - baut Fluux Messenger fuer iOS mit eigener Kennung und laedt es nach TestFlight
+# Version: 1.0.0
+# Datum: 2026-10-23
+#
+# Quelle ist immer das juengste Upstream-Release von processone/fluux-messenger (nicht main).
+# Gebaut wird, wenn es ein neues Release gibt (taeglicher Blick) oder am Monatsersten
+# (TestFlight-Builds laufen nach 90 Tagen ab). Von Hand: "Run workflow", optional mit Tag.
+# Doku: devops-automation/deploy/fluux-ios/README.md
+name: Toms iOS TestFlight
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream-Tag (leer = juengstes Release)'
+        required: false
+      erzwingen:
+        description: 'Auch bauen, wenn der Tag schon gebaut wurde'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  KENNUNG: one.mydc.fluux
+
+jobs:
+  pruefen:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+      bauen: ${{ steps.t.outputs.bauen }}
+    steps:
+      - id: t
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EINGABE: ${{ inputs.tag }}
+          ERZWINGEN: ${{ inputs.erzwingen }}
+        run: |
+          tag="${EINGABE:-$(gh api repos/processone/fluux-messenger/releases/latest --jq .tag_name)}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Schon gebaut? Erfolgreiche Laeufe dieses Workflows tragen den Tag im Laufnamen.
+          gebaut=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/toms-ios.yml/runs?status=success&per_page=50" \
+            --jq "[.workflow_runs[] | select(.display_title | contains(\"$tag\"))] | length")
+          tag_heute=$(date -u +%d)
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$ERZWINGEN" = true ]; then bauen=ja
+          elif [ "$gebaut" = 0 ]; then bauen=ja
+          elif [ "$tag_heute" = 01 ]; then bauen=ja
+          else bauen=nein; fi
+          echo "Tag $tag, bisher erfolgreich gebaut: $gebaut, bauen: $bauen"
+          echo "bauen=$bauen" >> "$GITHUB_OUTPUT"
+
+  bauen:
+    needs: pruefen
+    if: needs.pruefen.outputs.bauen == 'ja'
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Upstream-Release auschecken
+        uses: actions/checkout@v4
+        with:
+          repository: processone/fluux-messenger
+          ref: ${{ needs.pruefen.outputs.tag }}
+      - name: Eigene Dateien holen
+        uses: actions/checkout@v4
+        with:
+          path: _toms
+      - name: Identitaet umstellen und festschreiben
+        run: |
+          bash _toms/toms/patch-identitaet.sh "$KENNUNG"
+          rm -rf _toms
+          git -c user.name=toms-build -c user.email=build@mydc.one commit -qam "Toms Identitaet $KENNUNG"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+          components: llvm-tools
+      - name: Werkzeuge
+        run: |
+          command -v xcodegen || brew install xcodegen
+          command -v pod || brew install cocoapods
+          xcodebuild -version
+      - run: npm ci
+      - run: npm run tauri:ios:init
+      - name: Bauen und nach TestFlight laden
+        env:
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
+          npm run tauri:ios:testflight
