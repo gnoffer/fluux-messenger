@@ -1,5 +1,5 @@
 # toms-ios.yml - baut Fluux Messenger fuer iOS mit eigener Kennung und laedt es nach TestFlight
-# Version: 1.0.0
+# Version: 1.0.2
 # Datum: 2026-10-23
 #
 # Quelle ist immer das juengste Upstream-Release von processone/fluux-messenger (nicht main).
@@ -23,7 +23,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 env:
   KENNUNG: one.mydc.fluux
@@ -41,17 +40,18 @@ jobs:
           EINGABE: ${{ inputs.tag }}
           ERZWINGEN: ${{ inputs.erzwingen }}
         run: |
-          tag="${EINGABE:-$(gh api repos/processone/fluux-messenger/releases/latest --jq .tag_name)}"
+          if [ -n "$EINGABE" ]; then tag="$EINGABE"; neu=0
+          else
+            read -r tag datum < <(gh api repos/processone/fluux-messenger/releases/latest --jq '.tag_name + " " + .published_at')
+            # Neu = in den letzten 26 Stunden veroeffentlicht (taeglicher Lauf + Puffer)
+            neu=$(( $(date -u +%s) - $(date -u -d "$datum" +%s) < 26*3600 ? 1 : 0 ))
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          # Schon gebaut? Erfolgreiche Laeufe dieses Workflows tragen den Tag im Laufnamen.
-          gebaut=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/toms-ios.yml/runs?status=success&per_page=50" \
-            --jq "[.workflow_runs[] | select(.display_title | contains(\"$tag\"))] | length")
-          tag_heute=$(date -u +%d)
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$ERZWINGEN" = true ]; then bauen=ja
-          elif [ "$gebaut" = 0 ]; then bauen=ja
-          elif [ "$tag_heute" = 01 ]; then bauen=ja
+          elif [ "$neu" = 1 ]; then bauen=ja
+          elif [ "$(date -u +%d)" = 01 ]; then bauen=ja
           else bauen=nein; fi
-          echo "Tag $tag, bisher erfolgreich gebaut: $gebaut, bauen: $bauen"
+          echo "Tag $tag, neu: $neu, bauen: $bauen"
           echo "bauen=$bauen" >> "$GITHUB_OUTPUT"
 
   bauen:
@@ -99,3 +99,16 @@ jobs:
           export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
           printf '%s\n' "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
           npm run tauri:ios:testflight
+      - name: Signier-Logs sichern (nur bei Fehler)
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/diag"
+          find /var/folders "$TMPDIR" -maxdepth 4 -name '*.xcdistributionlogs' -exec cp -R {} "$RUNNER_TEMP/diag/" \; 2>/dev/null || true
+          ls -la "$RUNNER_TEMP/diag"
+      - name: Signier-Logs hochladen
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcode-distribution-logs
+          path: ${{ runner.temp }}/diag
+          retention-days: 7
